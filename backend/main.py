@@ -1,6 +1,6 @@
 # backend/main.py
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Set
 
 import asyncio
@@ -54,6 +54,122 @@ def ts_utc_from_finnhub(ts_val):
     # if it's huge, it's milliseconds
     sec = ts_val / 1000.0 if ts_val > 1e12 else float(ts_val)
     return datetime.fromtimestamp(sec, tz=timezone.utc)
+
+# ===================== Yahoo Finance helpers =====================
+
+def _yahoo_interval_for_res(res: str | int) -> str:
+    """
+    Map our resolution to Yahoo interval strings.
+    'D' -> '1d', numeric minutes -> '<m>m'
+    """
+    if isinstance(res, str) and res.upper() == "D":
+        return "1d"
+    return f"{int(res)}m"
+
+def _chunk_days_for_interval(interval: str) -> int:
+    # conservative chunking to avoid rate limits:
+    if interval.endswith("m"):
+        # intraday (1m): Yahoo caps ~7 days; stay smaller
+        return 3
+    # daily: safe, but keep chunks modest
+    return 180
+
+def _backoff_sleep(attempt: int):
+    # exponential backoff with a little jitter
+    base = min(8, 2 ** max(0, attempt))
+    time.sleep(base + random.uniform(0.0, 0.4))
+
+async def yahoo_fetch_and_insert(symbol: str, res: str | int, since_ts: datetime | None):
+    """
+    Fetch candles from Yahoo since 'since_ts' (exclusive) up to now, and insert closes into 'prices'.
+    Res can be 'D' or minutes (1,5,15,60). Uses chunking + retries.
+    """
+    interval = _yahoo_interval_for_res(res)
+    chunk_days = _chunk_days_for_interval(interval)
+
+    now_sec = int(time.time())
+    if since_ts is None:
+        # default backfill window if no data—1 year for daily, 5 days for 1m
+        start_sec = now_sec - (365 * 24 * 60 * 60 if interval == "1d" else 5 * 24 * 60 * 60)
+    else:
+        # start a little earlier than last point to be safe (overlap)
+        margin = 2 * 60 if interval.endswith("m") else 24 * 60 * 60
+        start_sec = max(0, int(since_ts.timestamp()) - margin)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; charts-catchup/1.0)",
+        "Accept": "application/json, text/plain, */*",
+    }
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+    inserted_total = 0
+    t2 = now_sec
+
+    # Simple rate-limit guard if called for multiple symbols/resolutions on boot
+    await asyncio.sleep(random.uniform(0.1, 0.6))
+
+    with httpx.Client(timeout=20, headers=headers) as client, SessionLocal() as db:
+        while t2 > start_sec:
+            t1 = max(start_sec, t2 - chunk_days * 24 * 60 * 60)
+            params = {
+                "period1": t1,
+                "period2": t2,
+                "interval": interval,
+                "includePrePost": "true",
+                "events": "history",
+                "lang": "en-US",
+                "region": "US",
+            }
+
+            # retry transient issues
+            for attempt in range(5):
+                r = client.get(url, params=params)
+                if r.status_code == 200:
+                    break
+                if r.status_code in (429, 502, 503, 504):
+                    _backoff_sleep(attempt)
+                    continue
+                print(f"yahoo chunk error {symbol} {interval} {t1}-{t2} {r.status_code} {r.text[:120]}")
+                return inserted_total
+
+            if r.status_code != 200:
+                print(f"yahoo error {symbol} {interval}: {r.status_code} {r.text[:120]}")
+                return inserted_total
+
+            try:
+                data = r.json()
+                result = data["chart"]["result"][0]
+                ts_list = result.get("timestamp") or []
+                ind = (result.get("indicators") or {}).get("quote") or [{}]
+                open_list = ind[0].get("open") or []
+                high_list = ind[0].get("high") or []
+                low_list  = ind[0].get("low")  or []
+                close_list= ind[0].get("close") or []
+            except Exception as e:
+                ts_list, open_list, high_list, low_list, close_list = [], [], [], [], []
+
+            if ts_list and close_list:
+                for t, o, h, l, c in zip(ts_list, open_list, high_list, low_list, close_list):
+                    if None in (o, h, l, c):
+                        continue
+                    rows = [
+                        {"t": int(t) + 0,  "sym": symbol, "p": float(o)},  # earliest -> open
+                        {"t": int(t) + 15, "sym": symbol, "p": float(l)},  # low mid-bucket
+                        {"t": int(t) + 30, "sym": symbol, "p": float(h)},  # high mid-bucket
+                        {"t": int(t) + 59, "sym": symbol, "p": float(c)},  # latest -> close
+                    ]
+                    for rrow in rows:
+                        db.execute(
+                            text("INSERT INTO prices (ts, symbol, price) VALUES (to_timestamp(:t), :sym, :p)"),
+                            rrow,
+                        )
+                    inserted_total += 1
+                db.commit()
+
+            t2 = t1
+            time.sleep(0.25)  # be polite
+
+    return inserted_total
 
 # ===================== WebSocket manager =====================
 class WSManager:
@@ -348,20 +464,30 @@ def backfill_yahoo(symbol: str, res: str = "D", days: int = 120, include_prepost
                 result = data["chart"]["result"][0]
                 ts_list = result.get("timestamp") or []
                 ind = (result.get("indicators") or {}).get("quote") or [{}]
-                close_list = ind[0].get("close") or []
+                open_list = ind[0].get("open") or []
+                high_list = ind[0].get("high") or []
+                low_list  = ind[0].get("low")  or []
+                close_list= ind[0].get("close") or []
             except Exception as e:
                 # If this chunk has no data, just move to the next
-                ts_list, close_list = [], []
+                ts_list, open_list, high_list, low_list, close_list = [], [], [], [], []
 
-            # Insert CLOSEs as points at bar time
+            # Insert O/L/H/C as four synthetic ticks in the same bucket so /ohlc builds real bodies
             if ts_list and close_list:
-                for t, c in zip(ts_list, close_list):
-                    if c is None:
+                for t, o, h, l, c in zip(ts_list, open_list, high_list, low_list, close_list):
+                    if None in (o, h, l, c):
                         continue
-                    db.execute(
-                        text("INSERT INTO prices (ts, symbol, price) VALUES (to_timestamp(:t), :sym, :p)"),
-                        {"t": int(t), "sym": symbol, "p": float(c)},
-                    )
+                    rows = [
+                        {"t": int(t) + 0,  "sym": symbol, "p": float(o)},
+                        {"t": int(t) + 15, "sym": symbol, "p": float(l)},
+                        {"t": int(t) + 30, "sym": symbol, "p": float(h)},
+                        {"t": int(t) + 59, "sym": symbol, "p": float(c)},
+                    ]
+                    for rrow in rows:
+                        db.execute(
+                            text("INSERT INTO prices (ts, symbol, price) VALUES (to_timestamp(:t), :sym, :p)"),
+                            rrow,
+                        )
                     inserted_total += 1
                 db.commit()
 
@@ -387,6 +513,44 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     loop = asyncio.get_event_loop()
     loop.create_task(finnhub_poll_task())  
+    loop.create_task(startup_catchup_task())
+    
+    
+    
+# ========= Startup catch-up task =========
+CATCHUP_ENABLED = os.getenv("CATCHUP_ON_START", "1") not in ("0", "false", "False", "")
+CATCHUP_SYMBOLS = (os.getenv("CATCHUP_SYMBOLS") or "SPY,QQQ").replace(" ", "").split(",")
+# Which resolutions to catch up: daily 'D' and intraday '1' minute by default
+CATCHUP_RESOLUTIONS = (os.getenv("CATCHUP_RESOLUTIONS") or "D,1").replace(" ", "").split(",")
+
+async def startup_catchup_task():
+    if not CATCHUP_ENABLED:
+        print("⏭️  catch-up disabled by CATCHUP_ON_START=0")
+        return
+
+    print(f"🔄 Yahoo catch-up starting for symbols={CATCHUP_SYMBOLS} res={CATCHUP_RESOLUTIONS}")
+    try:
+        with SessionLocal() as db:
+            for sym in CATCHUP_SYMBOLS:
+                # last timestamp we have
+                last_ts = db.execute(
+                    text("SELECT MAX(ts) FROM prices WHERE symbol=:s"),
+                    {"s": sym},
+                ).scalar()
+                print(f"  → {sym}: last_ts={last_ts}")
+
+                # run both daily and intraday (or whatever you configured)
+                for res in CATCHUP_RESOLUTIONS:
+                    inserted = await yahoo_fetch_and_insert(sym, res, last_ts)
+                    print(f"    {sym} res={res}: inserted {inserted} points")
+                    # small pause between runs
+                    await asyncio.sleep(0.5)
+
+        print("✅ Yahoo catch-up complete")
+    except Exception as e:
+        print("⚠️ catch-up failed:", e)
+        
+        
 
 # ===================== HTTP routes =====================
 @app.get("/")
